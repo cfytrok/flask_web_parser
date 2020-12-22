@@ -13,7 +13,7 @@ from celery import Celery
 celery_app = Celery('crawler', backend='redis://localhost:6379/0', broker='redis://localhost:6379/0')
 
 ARCHIVES_PATH = Path(__file__).parent.absolute() / 'static'  # папка, куда сохраняются архивы
-DEPTH = 1  # глубина прохода по ссылкам
+DEPTH = 3  # глубина прохода по ссылкам
 
 
 @celery_app.task(bind=True)
@@ -43,29 +43,35 @@ class Crawler:
     async def save_url(self, url, depth):
         """Сохраняет url в папку"""
         tasks = []
-        parse_result = urlparse(url)
         try:
             async with self.session.get(url) as resp:
-                if resp.status == 200:
-                    # загружаем файл
-                    content = await resp.read()
+                final_url = str(resp.url)
+                self.visited.add(final_url)
+                parse_result = urlparse(final_url)
+                if not resp.status == 200:
+                    raise Exception(f'Bad status: {resp.status}')
+                # загружаем файл
+                content = await resp.read()
 
-                    # формируем путь
-                    file_path = self.make_file_path(parse_result)
-                    file_path.parent.mkdir(parents=True, exist_ok=True)
-                    # сохраняем файл
-                    async with aiofiles.open(file_path, mode='wb') as f:
-                        await f.write(content)
+                # формируем путь
+                file_path = self.make_file_path(parse_result)
+                file_path.parent.mkdir(parents=True, exist_ok=True)
+                # сохраняем файл
+                async with aiofiles.open(file_path, mode='wb') as f:
+                    await f.write(content)
 
-                    # собираем ссылки
-                    if depth and url.endswith('/') or url.endswith('.html') or url.endswith('.php'):
-                        text = content.decode(encoding=resp.get_encoding())
-                        tasks = [asyncio.create_task(self.save_url(link, depth - 1)) for link in
-                                 self.collect_urls(url, text)]
-                    if tasks:
-                        await asyncio.gather(*tasks)
+                # собираем ссылки
+                if depth and (not parse_result.path or
+                              parse_result.path.endswith('/') or
+                              parse_result.path.endswith('.html') or
+                              parse_result.path.endswith('.php')):
+                    text = content.decode(encoding=resp.get_encoding())
+                    tasks = [asyncio.create_task(self.save_url(link, depth - 1)) for link in
+                             self.collect_urls(url, text)]
+                if tasks:
+                    await asyncio.gather(*tasks)
         except Exception as err:
-            self.errors.append(err)
+            self.errors.append((resp.url, err))
 
     def collect_urls(self, current_url, text):
         """Собирает валидные ссылки на файлы для сохранения"""
@@ -93,8 +99,12 @@ class Crawler:
 
     def make_file_path(self, parse_result):
         # создаем путь файла id задачи/домен/файлы
-        path = Path(parse_result.path.strip('/'))
-        if path.is_dir():
+        path = ARCHIVES_PATH / self.task_id / parse_result.netloc / parse_result.path.strip('/')
+        if not parse_result.path or parse_result.path.endswith('/'):
             path /= 'index.html'
-        path = ARCHIVES_PATH / self.task_id / parse_result.netloc / path
         return path
+
+
+if __name__ == '__main__':
+    c = Crawler()
+    asyncio.run(c.run('http://timeweb.com', 'test', DEPTH))
