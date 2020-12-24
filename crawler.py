@@ -2,46 +2,50 @@ import asyncio
 import re
 import shutil
 from pathlib import Path
+from typing import List, Iterator, Tuple
 
 import aiofiles
 import aiohttp
 import lxml.html
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin, urlparse, ParseResult
 
 from celery import Celery
 
-celery_app = Celery('crawler', backend='redis://localhost:6379/0', broker='redis://localhost:6379/0')
+ARCHIVES_PATH = Path(__file__).parent.absolute() / 'static'  # Папка, куда сохраняются архивы
+DEPTH = 2  # Глубина прохода по ссылкам
 
-ARCHIVES_PATH = Path(__file__).parent.absolute() / 'static'  # папка, куда сохраняются архивы
-DEPTH = 3  # глубина прохода по ссылкам
+celery_app = Celery('crawler', backend='redis://localhost:6379/0', broker='redis://localhost:6379/0')
 
 
 @celery_app.task(bind=True)
-def save_web_site(self, url):
+def save_web_site(self, url: str) -> Tuple[bool, List[str]]:
+    """Обходит сайт, начиная с url и сохраняет файлы. Потом создает архив."""
     c = Crawler()
     asyncio.run(c.run(url, self.request.id, DEPTH))
-    dir_name = str(ARCHIVES_PATH / self.request.id)
-    shutil.make_archive(dir_name, 'zip', dir_name)
-    return c.errors
+    dir_name = ARCHIVES_PATH / self.request.id
+    if dir_name.exists():
+        shutil.make_archive(dir_name, 'zip', dir_name)
+    return dir_name.exists(), c.errors
 
 
 class Crawler:
-    start_url = None
-    task_id = None
-
     def __init__(self):
-        self.visited = set()
+        self.start_url = None
+        self.task_id = None
+        self.visited = set()  # url страниц, которые уже обработаны
+        self.errors = []  # Список ошибок
 
-    async def run(self, url, task_id, depth):
-        self.errors = []
+    async def run(self, url: str, task_id: str, depth: int) -> None:
+        """Запуск паука"""
+        self.errors.clear()
         self.visited.clear()
         self.start_url = urlparse(url)
         self.task_id = task_id
         async with aiohttp.ClientSession() as self.session:
             await self.save_url(url, depth)
 
-    async def save_url(self, url, depth):
-        """Сохраняет url в папку"""
+    async def save_url(self, url: str, depth: int) -> None:
+        """Сохраняет url в папку. Если html, то парсит ссылки на странице и запускает задачи по обработке ссылок."""
         tasks = []
         try:
             async with self.session.get(url) as resp:
@@ -50,17 +54,19 @@ class Crawler:
                 parse_result = urlparse(final_url)
                 if not resp.status == 200:
                     raise Exception(f'Bad status: {resp.status}')
-                # загружаем файл
+
+                # Загружаем файл
                 content = await resp.read()
 
-                # формируем путь
+                # Формируем путь
                 file_path = self.make_file_path(parse_result)
                 file_path.parent.mkdir(parents=True, exist_ok=True)
-                # сохраняем файл
+
+                # Сохраняем файл
                 async with aiofiles.open(file_path, mode='wb') as f:
                     await f.write(content)
 
-                # собираем ссылки
+                # Собираем ссылки
                 if depth and (not parse_result.path or
                               parse_result.path.endswith('/') or
                               parse_result.path.endswith('.html') or
@@ -71,34 +77,38 @@ class Crawler:
                 if tasks:
                     await asyncio.gather(*tasks)
         except Exception as err:
-            self.errors.append((resp.url, err))
+            try:
+                bad_url = final_url
+            except:
+                bad_url = url
+            self.errors.append(f'Url: {bad_url} Error: {str(err)}')
 
-    def collect_urls(self, current_url, text):
+    def collect_urls(self, current_url: str, text: str) -> Iterator[str]:
         """Собирает валидные ссылки на файлы для сохранения"""
         html = lxml.html.fromstring(text)
         for element, attribute, link, _ in html.iterlinks():
             if not link.startswith('http') and re.match(r'\w+:', link):
                 continue
-            # если ссылка, проверяем, что локальная
+            # Если ссылка, проверяем, что локальная
             link_parse = urlparse(link)
-            # пропускаем сложные ссылки
+            # Пропускаем сложные ссылки
             if link_parse.fragment or link_parse.params or link_parse.query:
                 continue
             if element.tag == 'a':
-                # пропускаем ссылки на внешние домены
+                # Пропускаем ссылки на внешние домены
                 if link_parse.netloc and link_parse.netloc != self.start_url.netloc:
                     continue
             absolute_link = link
             if not link_parse.netloc:
                 absolute_link = urljoin(current_url, link)
-            # пропускаем те, что уже загрузили
+            # Пропускаем те, что уже загрузили
             if absolute_link in self.visited:
                 continue
             self.visited.add(absolute_link)
             yield absolute_link
 
-    def make_file_path(self, parse_result):
-        # создаем путь файла id задачи/домен/файлы
+    def make_file_path(self, parse_result: ParseResult) -> Path:
+        # Создает путь файла Папка архивов/id задачи/домен/файл
         path = ARCHIVES_PATH / self.task_id / parse_result.netloc / parse_result.path.strip('/')
         if not parse_result.path or parse_result.path.endswith('/'):
             path /= 'index.html'
@@ -107,4 +117,4 @@ class Crawler:
 
 if __name__ == '__main__':
     c = Crawler()
-    asyncio.run(c.run('http://timeweb.com', 'test', DEPTH))
+    asyncio.run(c.run('http://timewebx.com', 'test', DEPTH))

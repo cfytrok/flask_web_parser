@@ -1,0 +1,16 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Task status</title>
+</head>
+<body>
+{% if file_url %}
+<a href={{file_url}}>{{file_url}}</a>
+{% endif %}
+{% for error in errors %}
+<p>{{error}}</p>
+{% endfor %}
+
+</body>
+</html>
